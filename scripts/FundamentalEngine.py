@@ -1,6 +1,67 @@
 import pandas as pd
 import numpy as np
 
+'''
+Everything is written to work on quarterly data
+'''
+
+#0. Functions
+def compute_eps_growth_qoq(df: pd.DataFrame):
+    """
+    EPS growth quarter-over-quarter.
+    Computes the shifted series once and reuses it to avoid
+    double-groupby misalignment.
+    """
+    shifted = df.groupby('act_symbol')['eps'].shift(1)
+    return (df['eps'] - shifted) / shifted.abs().replace(0, np.nan)
+
+def compute_eps_growth_yoy(df: pd.DataFrame):
+    """
+    EPS growth year-over-year (4 quarters back).
+    Assumes quarterly data — raises a warning if annual rows are detected.
+    """
+    shifted = df.groupby('act_symbol')['eps'].shift(4)
+    return (df['eps'] - shifted) / shifted.abs().replace(0, np.nan)
+
+def compute_revenue_growth_yoy(df: pd.DataFrame):
+    """
+    Revenue growth year-over-year (4 quarters back).
+    Assumes quarterly data — raises a warning if annual rows are detected.
+    """
+    shifted = df.groupby('act_symbol')['revenue'].shift(4)
+    return (df['revenue'] - shifted) / shifted.abs().replace(0, np.nan)
+
+
+def compute_asset_growth_yoy(df: pd.DataFrame):
+    """
+    Total asset growth year-over-year (4 quarters back).
+    Assumes quarterly data — raises a warning if annual rows are detected.
+    """
+    shifted = df.groupby('act_symbol')['total_assets'].shift(4)
+    return (df['total_assets'] - shifted) / shifted.abs().replace(0, np.nan)
+
+def compute_quick_ratio(df: pd.DataFrame):
+    """
+    Quick ratio using the additive method:
+        (cash + short_term_investments + net_receivables) / current_liabilities
+
+    This is more conservative than subtracting inventory from current assets,
+    as it excludes illiquid current assets like prepaid expenses, deferred costs,
+    and other non-cash items that the inventory-subtraction method implicitly includes.
+
+    Required columns:
+        - cash_and_equivalents
+        - short_term_investments
+        - net_receivables
+        - current_liabilities
+    """
+    liquid_assets = (
+        df['cash_and_equivalents']
+        + df['short_term_investments'].fillna(0)
+        + df['net_receivables'].fillna(0)
+    )
+    return liquid_assets / df['current_liabilities'].replace(0, np.nan)
+
 # ==========================================
 # 1. THE REGISTRY
 # ==========================================
@@ -67,12 +128,12 @@ FUNDAMENTAL_REGISTRY = {
     # --- MOMENTUM (Assumes Sparse Quarterly Rows) ---
     'EPS_GROWTH_QOQ': {
         # Shift 1 = 1 Quarter back
-        'fn': lambda df: (df['eps'] - df.groupby('act_symbol')['eps'].shift(1)) / df.groupby('act_symbol')['eps'].shift(1).abs().replace(0, np.nan),
+        'fn': compute_eps_growth_qoq,
         'inputs': ['eps']
     },
     'EPS_GROWTH_YOY': {
         # Shift 4 = 4 Quarters back (1 Year)
-        'fn': lambda df: (df['eps'] - df.groupby('act_symbol')['eps'].shift(4)) / df.groupby('act_symbol')['eps'].shift(4).abs().replace(0, np.nan),
+        'fn': compute_eps_growth_yoy,
         'inputs': ['eps']
     },
     'REVENUE_GROWTH_YOY': {
@@ -116,7 +177,6 @@ class FundamentalRequest:
             raise ValueError(f"Fundamental Feature '{name}' not found in Registry")
         self.name = name
         self.alias = alias if alias else f"F_{name}"
-
 
 # ==========================================
 # 3. THE ENGINE
