@@ -370,6 +370,19 @@ def calc_forward_return(close, timeperiod=1):
     
     return fwd_ret.values
 
+def calc_rate_spread(term1, term2, timeperiod=1):
+    """Calculates the simple difference between two rates (Spread)"""
+    return (np.array(term1) - np.array(term2))
+
+def calc_rate_butterfly(short_term, mid_term, long_term, timeperiod=1):
+    """Calculates butterfly spread curvature"""
+    return (np.array(short_term) + np.array(long_term)) - (2 * np.array(mid_term))
+
+def calc_rate_velocity(rate, timeperiod=1):
+    """Calculates absolute change over time (Velocity/Momentum)"""
+    s = pd.Series(rate)
+    return s.diff(timeperiod).values
+
 # ==========================================
 # 1. THE REGISTRY
 # ==========================================
@@ -517,11 +530,31 @@ FEATURE_REGISTRY = {
         'outputs': ['real']
     },
 
+    'RATE_SPREAD': {
+        'type': 'custom_stat',
+        'fn': calc_rate_spread,
+        'outputs': ['real']
+    },
+
+    'RATE_BUTTERFLY': {
+        'type': 'custom_stat',
+        'fn': calc_rate_butterfly,
+        'outputs': ['real']
+    },
+
+    'RATE_VELOCITY': {
+        'type': 'custom_stat',
+        'fn': calc_rate_velocity,
+        'outputs':['real']
+    },
+
 }
 
 # ==========================================
-# 2. THE REQUEST OBJECT
+# Requests
 # ==========================================
+
+#price features
 class FeatureRequest:
     def __init__(self, name, params=None, shift=0, input_type='log_price', 
                  market_ref=None, alias=None, deriv_order=0, 
@@ -573,6 +606,39 @@ class FeatureRequest:
                 self.base_col_name = f"{name}_{param_str}_{input_type}{deriv_suffix}_{shift_str}_{type_suffix}"
 
         # 2. Generate the FINAL name (Including transforms)
+        self.col_name = self.base_col_name
+        if self.transform:
+            self.col_name += f"_{self.transform.upper()}"
+
+#rate feature request
+class RateFeatureRequest:
+    def __init__(self, name, term1=None, term2=None, term3=None, timeperiod=1, transform=None, transform_params=None):
+        """
+        name: 'RATE_SPREAD', 'RATE_VELOCITY', or 'RATE_BUTTERFLY'
+        term1: e.g., '10_year'
+        term2: e.g., '2_year' (Mid-point for butterfly)
+        term3: e.g., '3_month' (Short-point for butterfly)
+        timeperiod: Used for velocity (e.g., 5 for 5-day change)
+        """
+        self.name = name.upper()
+        self.term1 = term1
+        self.term2 = term2
+        self.term3 = term3
+        self.timeperiod = timeperiod
+        self.transform = transform
+        self.transform_params = transform_params if transform_params else {}
+        
+        # Generate clean base column names
+        if self.name == 'SPREAD':
+            self.base_col_name = f"RATE_SPR_{term1}_{term2}"
+        elif self.name == 'VELOCITY':
+            self.base_col_name = f"RATE_VEL_{term1}_{timeperiod}d"
+        elif self.name == 'BUTTERFLY':
+            self.base_col_name = f"RATE_FLY_{term1}_{term2}_{term3}"
+        else:
+            self.base_col_name = f"RATE_{self.name}"
+            
+        # Final column name (includes transform suffix if applicable)
         self.col_name = self.base_col_name
         if self.transform:
             self.col_name += f"_{self.transform.upper()}"
