@@ -487,7 +487,6 @@ class Model:
                     "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
                     "bagging_freq": trial.suggest_int("bagging_freq", 1, 7),
                     "seed": 42,
-                    "colsample_bytree": 0.1
                 }
 
                 dtrain = lgb.Dataset(self.X_train, label=self.y_train)
@@ -523,7 +522,6 @@ class Model:
                 '''
 
                 return return_val
-                
 
         study = optuna.create_study(direction=direction) 
         study.optimize(objective, n_trials=50)
@@ -555,7 +553,7 @@ class Model:
             )
         self.test_model()
         if type(save_name) != type(None):
-            self.model.save_model(f"Data/{save_name}.txt")
+            self.model.save_model(f"{save_name}.txt")
 
     def test_model(self):
         """Tests the model after generating
