@@ -991,6 +991,132 @@ class Model:
         print(f"Features dropped       : {len(features_to_drop)}")
         print(f"Remaining clean features: {len(self.features)}")
 
+    def run_permutation_test(self, n_repeats=5):
+        """
+        Shuffles the target variable randomly and retrains. 
+        If the model still finds a signal (positive Sharpe/IC), your features are 
+        leaking the target directly (e.g., using today's close to predict today's return).
+        """
+        if not self.data_split:
+            raise Exception("Split data first.")
+            
+        print(f"\n--- Running Permutation Test ({n_repeats} Iterations) ---")
+        original_y_train = self.y_train.copy()
+        leakage_detected = False
+        
+        for i in range(n_repeats):
+            # 1. Randomly shuffle the training targets
+            self.y_train = np.random.permutation(original_y_train)
+            
+            # 2. Train a fast model on the garbage data
+            params = {
+                'objective': 'regression' if self.target_type == 'regression' else 'binary',
+                'verbosity': -1, 'seed': 42 + i, 'boosting_type': 'gbdt'
+            }
+            dtrain = lgb.Dataset(self.X_train, label=self.y_train)
+            gbm = lgb.train(params, dtrain, num_boost_round=50)
+            
+            # 3. Predict on un-shuffled test data
+            preds = gbm.predict(self.X_test)
+            
+            # 4. Check correlation
+            ic, _ = spearmanr(self.y_test_bin, preds)
+            print(f"  -> Shuffle {i+1} Rank IC: {ic:.4f}")
+            
+            # If a model trained on random noise achieves an IC > 0.02, something is leaking
+            if abs(ic) > 0.02:
+                leakage_detected = True
+                
+        # Restore actual target
+        self.y_train = original_y_train
+        
+        if leakage_detected:
+            print("\n🚨 WARNING: Model found a strong signal in randomized noise!")
+            print("Your features are leaking future data. Check your FeatureEngine logic.")
+        else:
+            print("\n✅ Permutation test passed. No obvious target leakage detected.")
+
+
+    def evaluate_with_transaction_costs(self, quantiles=10, bps_fee=5):
+        """
+        Recalculates the Long-Short spread accounting for daily portfolio turnover and slippage.
+        bps_fee = basis points charged per trade (5 bps = 0.05% slippage/fee per trade)
+        """
+        if "pred_return" not in self.test_df.columns:
+            raise Exception("Run test_model() first.")
+            
+        print(f"\n--- TRANSACTION COST ANALYSIS ({bps_fee} bps fee) ---")
+        df = self.test_df.copy()
+        
+        # 1. Assign daily quantiles
+        df['quantile'] = df.groupby('date')['pred_return'].transform(
+            lambda x: pd.qcut(x.rank(method='first'), q=quantiles, labels=False) + 1
+        )
+        
+        # 2. Isolate the Long (Top Q) and Short (Bottom Q) portfolios
+        longs = df[df['quantile'] == quantiles].copy()
+        shorts = df[df['quantile'] == 1].copy()
+        
+        # 3. Calculate Daily Turnover
+        # How many stocks from yesterday's top decile are NO LONGER in today's top decile?
+        def calc_turnover(portfolio_df):
+            daily_symbols = portfolio_df.groupby('date')['act_symbol'].apply(set)
+            turnover_pct =[]
+            dates = daily_symbols.index
+            for i in range(1, len(dates)):
+                prev_basket = daily_symbols.iloc[i-1]
+                curr_basket = daily_symbols.iloc[i]
+                # % of new stocks = (stocks in current but not in prev) / total current
+                new_stocks = len(curr_basket - prev_basket)
+                turnover_pct.append(new_stocks / max(len(curr_basket), 1))
+            return pd.Series([0] + turnover_pct, index=dates)
+
+        long_turnover = calc_turnover(longs)
+        short_turnover = calc_turnover(shorts)
+        
+        # 4. Calculate Gross vs Net Returns
+        target_col = self.targets[0]
+        daily_long_ret = longs.groupby('date')[target_col].mean()
+        daily_short_ret = shorts.groupby('date')[target_col].mean()
+        
+        gross_spread = daily_long_ret - daily_short_ret
+        
+        # Apply fees (Turnover * bps_fee/10000). Multiply by 2 because we pay to buy AND sell.
+        fee_decimal = bps_fee / 10000.0
+        daily_fees = (long_turnover * fee_decimal * 2) + (short_turnover * fee_decimal * 2)
+        
+        net_spread = gross_spread - daily_fees
+        
+        # 5. Extract N-day horizon for Sharpe annualization
+        match = re.search(r'(?:FWD_LOG_RET|TARGET_SHARPE)_(\d+)', self.target_key)
+        N = int(match.group(1)) if match else 1
+        
+        gross_sharpe = (gross_spread.mean() / gross_spread.std()) * np.sqrt(252 / N)
+        net_sharpe = (net_spread.mean() / net_spread.std()) * np.sqrt(252 / N)
+        
+        print(f"Average Daily Turnover (Longs) : {long_turnover.mean():.2%}")
+        print(f"Average Daily Turnover (Shorts): {short_turnover.mean():.2%}")
+        print(f"Gross Annual Sharpe            : {gross_sharpe:.4f}")
+        print(f"NET Annual Sharpe (After Fees) : {net_sharpe:.4f}")
+        
+        if net_sharpe < 0:
+            print("🚨 Your model's returns are entirely consumed by transaction costs.")
+        return net_spread
+
+    def check_feature_leakage(self):
+        """Flags features that are 'too important'."""
+        print("\n--- Feature Importance Sanity Check ---")
+        importances = self.model.feature_importance(importance_type='gain')
+        total_gain = importances.sum()
+        
+        features = self.model.feature_name()
+        
+        for feat, imp in zip(features, importances):
+            pct_importance = imp / total_gain
+            if pct_importance > 0.25:
+                print(f"🚨 WARNING: '{feat}' accounts for {pct_importance:.1%} of model's predictive power.")
+                print("   This almost always indicates a look-ahead bias (data leakage).")
+
 class PortfolioStrat:
     def __init__(self):
         pass
