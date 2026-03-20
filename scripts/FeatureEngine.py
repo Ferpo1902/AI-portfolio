@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import talib
 from numpy.lib.stride_tricks import sliding_window_view
+import gc
 
 #for viewing exceptions
 import traceback
@@ -548,6 +549,11 @@ FEATURE_REGISTRY = {
         'outputs':['real']
     },
 
+    'VIX': {
+        'type': 'macro',
+        'outputs': ['real'] # 'real' triggers a blank suffix, exactly mapping to 'VIX'
+    },
+
 }
 
 # ==========================================
@@ -614,13 +620,16 @@ class FeatureRequest:
 class RateFeatureRequest:
     def __init__(self, name, term1=None, term2=None, term3=None, timeperiod=1, transform=None, transform_params=None):
         """
-        name: 'RATE_SPREAD', 'RATE_VELOCITY', or 'RATE_BUTTERFLY'
-        term1: e.g., '10_year'
-        term2: e.g., '2_year' (Mid-point for butterfly)
-        term3: e.g., '3_month' (Short-point for butterfly)
-        timeperiod: Used for velocity (e.g., 5 for 5-day change)
+        name: 'SPREAD', 'VELOCITY', or 'BUTTERFLY' (or 'RATE_SPREAD', etc.)
+        term1: Long-term (e.g., '10_year')
+        term2: Mid-term for butterfly / Short-term for spread (e.g., '2_year')
+        term3: Short-term for butterfly (e.g., '3_month')
+        timeperiod: Used for velocity
         """
-        self.name = name.upper()
+        # Force the name to match the FEATURE_REGISTRY perfectly
+        clean_name = name.upper().replace("RATE_", "")
+        self.name = f"RATE_{clean_name}"
+        
         self.term1 = term1
         self.term2 = term2
         self.term3 = term3
@@ -628,15 +637,15 @@ class RateFeatureRequest:
         self.transform = transform
         self.transform_params = transform_params if transform_params else {}
         
-        # Generate clean base column names
-        if self.name == 'SPREAD':
-            self.base_col_name = f"RATE_SPR_{term1}_{term2}"
-        elif self.name == 'VELOCITY':
-            self.base_col_name = f"RATE_VEL_{term1}_{timeperiod}d"
-        elif self.name == 'BUTTERFLY':
-            self.base_col_name = f"RATE_FLY_{term1}_{term2}_{term3}"
+        # Generate clean base column names based on the type
+        if clean_name == 'SPREAD':
+            self.base_col_name = f"RATE_SPR_{term1}_{term2}_F"
+        elif clean_name == 'VELOCITY':
+            self.base_col_name = f"RATE_VEL_{term1}_{timeperiod}d_F"
+        elif clean_name == 'BUTTERFLY':
+            self.base_col_name = f"RATE_FLY_{term1}_{term2}_{term3}_F"
         else:
-            self.base_col_name = f"RATE_{self.name}"
+            self.base_col_name = self.name
             
         # Final column name (includes transform suffix if applicable)
         self.col_name = self.base_col_name
@@ -689,9 +698,14 @@ class FeatureEngine:
              df['gap_size'] = df['open'] - df['close'].shift(1)
              df.loc[mask, 'gap_size'] = np.nan
 
-        # D. Calendar
-        calendar_reqs = [r for r in self.requests if FEATURE_REGISTRY[r.name]['type'] == 'calendar']
-        other_reqs    = [r for r in self.requests if FEATURE_REGISTRY[r.name]['type'] != 'calendar']
+        # D. Separate Requests by Type
+        rate_reqs =[r for r in self.requests if isinstance(r, RateFeatureRequest)]
+        feature_reqs =[r for r in self.requests if isinstance(r, FeatureRequest)]
+        
+        macro_reqs =[r for r in feature_reqs if FEATURE_REGISTRY[r.name]['type'] == 'macro']
+
+        calendar_reqs =[r for r in feature_reqs if FEATURE_REGISTRY[r.name]['type'] == 'calendar']
+        other_reqs    = [r for r in feature_reqs if FEATURE_REGISTRY[r.name]['type'] != 'calendar']
         
         for req in calendar_reqs:
             attr = FEATURE_REGISTRY[req.name]['attr']
@@ -760,6 +774,110 @@ class FeatureEngine:
             df = df.merge(mkt_df, on='date', how='left')"""
 
         # -------------------------------------------------------
+        # PHASE 1.1: MACRO RATE CALCULATIONS (Global & Efficient)
+        # -------------------------------------------------------
+        if rate_reqs:
+            print(f"Phase 1.5: Loading & Computing {len(rate_reqs)} Macro Rate Features...")
+            
+            # 1. Load the raw Treasury rates
+            rates_raw = pd.read_csv("../Data/treasury_rates.csv")
+            rates_raw['date'] = pd.to_datetime(rates_raw['date'])
+            rates_raw = rates_raw.sort_values('date').reset_index(drop=True)
+            
+            # 2. Extract ONLY the unique dates present in your price data
+            # This ensures we calculate features exactly and only on the days you need
+            unique_dates = df['date'].unique()
+            macro_df = pd.DataFrame({'date': unique_dates}).sort_values('date').reset_index(drop=True)
+            
+            # 3. Align bond rates to the stock trading calendar
+            # merge_asof(direction='backward') is perfect here. If bonds are closed 
+            # (e.g., Veterans Day) but stocks are open, it safely pulls the most recent bond rate.
+            macro_df = pd.merge_asof(macro_df, rates_raw, on='date', direction='backward')
+            
+            # We no longer need the massive raw rate dataframe. Delete it immediately.
+            del rates_raw
+            gc.collect()
+
+            cols_to_merge = ['date']
+            
+            # 4. Process Rate Calculations purely on your specific stock trading days
+            for req in rate_reqs:
+                if req.name == 'RATE_SPREAD':
+                    macro_df[req.base_col_name] = calc_rate_spread(macro_df[req.term1], macro_df[req.term2])
+                
+                elif req.name == 'RATE_BUTTERFLY':
+                    macro_df[req.base_col_name] = calc_rate_butterfly(
+                        short_term=macro_df[req.term3], 
+                        mid_term=macro_df[req.term2], 
+                        long_term=macro_df[req.term1]
+                    )
+                
+                elif req.name == 'RATE_VELOCITY':
+                    # Because macro_df consists purely of your stock dates, 
+                    # a 5d velocity will now perfectly equal a "5 stock trading day" change.
+                    macro_df[req.base_col_name] = calc_rate_velocity(macro_df[req.term1], req.timeperiod)
+                
+                cols_to_merge.append(req.base_col_name)
+            
+            # 5. Extract only the engineered columns and merge back onto the main panel
+            rates_to_merge = macro_df[cols_to_merge]
+            df = df.merge(rates_to_merge, on='date', how='left')
+            
+            # CLEANUP MEMORY: Wipe our daily macro dataframe
+            del macro_df
+            del rates_to_merge
+            gc.collect()
+
+            # Ensure the panel stays perfectly sorted for Phase 2 GroupBy logic
+            df = df.sort_values(['act_symbol', 'date']).reset_index(drop=True)
+
+        # PHASE 1.2: MACRO DATA LOADING (Runs Once globally)
+        # -------------------------------------------------------
+        if macro_reqs:
+            print("Phase 1.6: Loading Global Macro Features...")
+            
+            # Check if VIX was requested
+            vix_req = next((r for r in macro_reqs if r.name == 'VIX'), None)
+            
+            if vix_req and 'VIX' not in df.columns:
+                # 1. Load the file exactly once
+                vix_raw = pd.read_csv("../Data/VIXCLS.csv")
+                vix_raw = vix_raw.rename(columns={'observation_date': 'date', 'VIXCLS': 'VIX'})
+                
+                # 2. Format dates and safely coerce FRED's "." strings to NaNs
+                vix_raw['date'] = pd.to_datetime(vix_raw['date'])
+                vix_raw['VIX'] = pd.to_numeric(vix_raw['VIX'], errors='coerce')
+                
+                # 3. Sort and forward-fill missing VIX days (holidays/weekends)
+                vix_raw = vix_raw.sort_values('date').reset_index(drop=True)
+                vix_raw = vix_raw.ffill()
+                
+                # 4. Extract ONLY the unique dates present in your price data
+                unique_dates = df['date'].unique()
+                vix_macro_df = pd.DataFrame({'date': unique_dates}).sort_values('date').reset_index(drop=True)
+                
+                # 5. Map VIX to your specific stock dates (safely pushing Friday values to weekends if your price data has weekend crypto/futures dates)
+                vix_macro_df = pd.merge_asof(vix_macro_df, vix_raw[['date', 'VIX']], on='date', direction='backward')
+                
+                # Drop raw data from memory immediately
+                del vix_raw
+                gc.collect()
+
+                # 6. Merge onto the main panel
+                df = df.merge(vix_macro_df, on='date', how='left')
+                
+                # 7. Map to the correct output column name requested by the user
+                # (Handles if the user requested FeatureRequest('VIX', transform='rank'))
+                if vix_req.base_col_name != 'VIX':
+                    df[vix_req.base_col_name] = df['VIX']
+
+                del vix_macro_df
+                gc.collect()
+
+                # Resort for Phase 2 safety
+                df = df.sort_values(['act_symbol', 'date']).reset_index(drop=True)
+
+        # -------------------------------------------------------
         # PHASE 2: GROUPBY LOOP (Time Series Features)
         # -------------------------------------------------------
         print(f"Phase 2: Computing {len(other_reqs)} Grouped Features...")
@@ -788,7 +906,7 @@ class FeatureEngine:
                 result_cols = {}
 
                 for req in other_reqs:
-                    print(req.name)
+                    #print(req.name)
                     config = FEATURE_REGISTRY[req.name]
                     ftype = config['type']
                     
@@ -805,7 +923,7 @@ class FeatureEngine:
                             args.append(src[input_name])
                     else:
                         if req.input_type == "raw":
-                            print(config)
+                            #print(config)
                             args.append(data_map[req.input_type][config["inputs"][0]])
                         else:
                             args.append(data_map[req.input_type]['real'])
@@ -878,7 +996,7 @@ class FeatureEngine:
         base_cols_used_for_transforms = set()
         
         for req in self.requests:
-            print(req.name)
+            #print(req.name)
             if not req.transform:
                 continue
 
