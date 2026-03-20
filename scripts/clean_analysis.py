@@ -28,6 +28,7 @@ from pdb import set_trace as st
 import os
 from scipy.stats import spearmanr
 import re
+import pickle
 
 
 def calculate_metrics_single(ticker, prices):
@@ -352,7 +353,7 @@ class Universe:
         return final_df
 
 class Model:
-    def __init__(self, universe_data):
+    def __init__(self, universe_data, model_folder = None):
         self.data = universe_data #all data to train the model on
         self.data["date"] = pd.to_datetime(self.data["date"])
         self.has_features = False #no features upon initialization
@@ -360,8 +361,14 @@ class Model:
         self.data_split = False #default whether data has been split to false
         self.params_tuned = False
         self.variables_generated = False
+        if type(model_folder) == type(None):
+            self.has_folder = False
+        else:
+            self.has_folder = True
+            os.makedirs(model_folder, exist_ok = True)
+        self.model_folder = model_folder
 
-    def add_target(self, target, target_type:str = "regression"):
+    def add_target(self, target, target_type:str = "regression", save:bool = True):
         valid_target_types = ["classification", "regression"]
         if target_type not in valid_target_types:
             err_msg = "Invalid target_type. Must be one of: "
@@ -371,14 +378,24 @@ class Model:
                     err_msg += ", "
         self.target = target
         self.target_type = target_type
+        if save == True:
+            if self.has_folder == True:
+                with open(f'{self.model_folder}/target.pkl', 'wb') as f:
+                    pickle.dump(target, f, pickle.HIGHEST_PROTOCOL)
         self.has_target = True
 
-    def add_features(self, features):
+    def add_features(self, features, save:bool = True):
         '''
         Adds features to the dataset
         '''
         self.features = features
         self.has_features = True
+        if save == True:
+            if self.has_folder == True:
+                os.makedirs(f"{self.model_folder}/features", exist_ok = True)
+                for c, feature in enumerate(features):
+                    with open(f'{self.model_folder}/features/{c}.pkl', 'wb') as f:
+                        pickle.dump(feature, f, pickle.HIGHEST_PROTOCOL)
 
     def split_data(self,
                    cutoffs:list = None
@@ -557,21 +574,57 @@ class Model:
         feature_keys = [key for key in self.data.keys() if "F" in key.split("_")]
         target_key = [key for key in self.data.keys() if "T" in key.split("_")][0]
         self.data = self.data.dropna(subset = feature_keys + [target_key]) #drop rows with nan for features or targets
+        self.feature_keys = feature_keys
+        self.target_key = target_key
 
     def train_model(self, 
                     perturb_hyperparameters:bool = False,
-                    save_name:str=None):
+                    inject_noise:bool = False):
+        '''
+        perturb_hyperparameters: adds 
+        inject_noise: 
+        '''
     
         if self.params_tuned == False:
             self.tune_params()
-        if perturb_hyperparameters == True:
-            #perturb hyperparameters
+
+        #===================
+        #Perturbing hyperparameters
+        if perturb_hyperparameters:
             params = {}
-            for param in self.best_params.keys():
-                rng = np.random.default_rng()
-                params[param] = rng.uniform(low = -0.1, high = 0.1)
+            # 1. Initialize rng once outside the loop
+            rng = np.random.default_rng()
+            
+            # Iterate through both keys and values using .items()
+            for param, val in self.best_params.items():
+                
+                # Calculate the multiplier: e.g., 1.07 or 0.93
+                multiplier = 1 + (rng.choice([1, -1]) * rng.uniform(low=0.05, high=0.1))
+                
+                # Apply the multiplier to the original value
+                new_val = val * multiplier
+                
+                # 2. Keep integers as integers (e.g., max_depth, n_estimators)
+                if isinstance(val, int) and not isinstance(val, bool):
+                    params[param] = int(round(new_val))
+                else:
+                    params[param] = new_val
         else:
-            params = self.best_params
+            # Good practice to copy so you don't accidentally mutate best_params later
+            params = self.best_params.copy()
+        #====================
+        
+        #====================
+        #Injecting Noise to features & targets
+        if inject_noise == True:
+            bps_3 = 0.0003 #use 3 basis points
+            for feature_key in self.feature_keys:
+                #for each feature, add 1-3 (0.01 - )
+                noise = np.random.normal(loc=0.0, scale=bps_3, size=len(self.data[feature_key].values))
+                self.data[feature_key] = self.data.feature_key * noise
+            noise = np.random.normal(loc=0.0, scale=bps_3, size=len(self.data[feature_key].values))
+            self.data[self.target_key] = self.data[self.target_key]*noise
+        #====================
         self.model = lgb.train(
                 params,
                 lgb.Dataset(self.X_train, label=self.y_train),
@@ -579,8 +632,8 @@ class Model:
                 callbacks=[lgb.early_stopping(stopping_rounds=50)]
             )
         self.test_model()
-        if type(save_name) != type(None):
-            self.model.save_model(f"{save_name}.txt")
+        if self.has_folder == True:
+            self.model.save_model(f"{self.model_folder}/model.txt")
 
     def test_model(self):
         """Tests the model after generating
