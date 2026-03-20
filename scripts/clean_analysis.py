@@ -395,15 +395,30 @@ class Model:
         elif cutoffs[1] >= cutoffs[2]:
             raise Exception(f"Test cutoff {cutoffs[2]} must be larger than validation cutoff {cutoffs[1]}")
         unique_dates = sorted(self.data['date'].unique())
-        print(len(unique_dates), int(len(unique_dates) * cutoffs[0]), int(len(unique_dates) * cutoffs[1]), int(len(unique_dates) * cutoffs[2]))
+        #print(len(unique_dates), int(len(unique_dates) * cutoffs[0]), int(len(unique_dates) * cutoffs[1]), int(len(unique_dates) * cutoffs[2]))
         #st()
         train_cutoff = unique_dates[int(len(unique_dates) * cutoffs[0])]
         val_cutoff = unique_dates[int(len(unique_dates) * cutoffs[1])]
         test_cutoff = unique_dates[int(len(unique_dates) * cutoffs[2]) - 1]
-        self.train_df = self.data[self.data['date'] < train_cutoff]
-        self.val_df = self.data[(self.data['date'] >= train_cutoff) & (self.data['date'] < val_cutoff)]
-        self.test_df = self.data[(self.data['date'] >= val_cutoff) & (self.data['date'] < test_cutoff)]
 
+        #Old, not purging the data
+        #self.train_df = self.data[self.data['date'] < train_cutoff]
+        #self.val_df = self.data[(self.data['date'] >= train_cutoff) & (self.data['date'] < val_cutoff)]
+        #self.test_df = self.data[(self.data['date'] >= val_cutoff) & (self.data['date'] < test_cutoff)]
+
+        # ADD A PURGE GAP (e.g., 5 days for a 5-day forward target)
+        # Extract N from target name
+        match = re.search(r'_(\d+)', self.target.name)
+        purge_gap_days = int(match.group(1)) if match else 1
+
+        # Shift the validation and test start dates forward by the purge gap
+        purge_offset = pd.Timedelta(days=purge_gap_days + 2) # +2 for weekends
+
+        self.train_df = self.data[self.data['date'] < train_cutoff]
+        # VALIDATION starts AFTER the purge gap
+        self.val_df = self.data[(self.data['date'] >= (train_cutoff + purge_offset)) & (self.data['date'] < val_cutoff)]
+        # TEST starts AFTER the purge gap
+        self.test_df = self.data[(self.data['date'] >= (val_cutoff + purge_offset)) & (self.data['date'] < test_cutoff)]
         self.features = [key for key in self.data.keys() if "F" in key.split("_")]
         self.targets = [key for key in self.data.keys() if "T" in key.split("_")]
         self.target_key = self.targets[0]
@@ -526,6 +541,7 @@ class Model:
         study = optuna.create_study(direction=direction) 
         study.optimize(objective, n_trials=50)
         self.best_params = study.best_params
+        self.study = study
         self.params_tuned = True
 
     def generate_targets_and_features(self):
@@ -537,16 +553,27 @@ class Model:
         feature_engine = FeatureEngine(feature_requests = self.features + [self.target])
         self.data = feature_engine.compute(self.data)
         #drop rows where targets and features are none
-        print(self.data.keys(), len(self.data))
+        #print(self.data.keys(), len(self.data))
         feature_keys = [key for key in self.data.keys() if "F" in key.split("_")]
         target_key = [key for key in self.data.keys() if "T" in key.split("_")][0]
         self.data = self.data.dropna(subset = feature_keys + [target_key]) #drop rows with nan for features or targets
 
-    def train_model(self, save_name:str=None):
+    def train_model(self, 
+                    perturb_hyperparameters:bool = False,
+                    save_name:str=None):
+    
         if self.params_tuned == False:
             self.tune_params()
+        if perturb_hyperparameters == True:
+            #perturb hyperparameters
+            params = {}
+            for param in self.best_params.keys():
+                rng = np.random.default_rng()
+                params[param] = rng.uniform(low = -0.1, high = 0.1)
+        else:
+            params = self.best_params
         self.model = lgb.train(
-                self.best_params,
+                params,
                 lgb.Dataset(self.X_train, label=self.y_train),
                 valid_sets=[lgb.Dataset(self.X_val, label=self.y_val)],
                 callbacks=[lgb.early_stopping(stopping_rounds=50)]
@@ -669,10 +696,6 @@ class Model:
         return mean_ic, std_ic, ic_ir, ann_ic_ir, t_stat
     
     def evaluate_quantile_spread(self, quantiles=10, plot=True):
-        """
-        Evaluates the model by dividing daily predictions into cross-sectional quantiles.
-        Calculates the actual target spread between the top (long) and bottom (short) quantiles.
-        """
         import re
         
         if "pred_return" not in self.test_df.columns:
@@ -684,74 +707,71 @@ class Model:
         print(f"\nQUANTILE SPREAD ANALYSIS (Top {100/quantiles:.1f}% vs Bottom {100/quantiles:.1f}%)")
         print("========================")
         
-        # 1. Assign cross-sectional quantiles daily (1 = Worst, 10 = Best)
-        # We use rank(method='first') to ensure qcut doesn't fail on duplicate predictions
         df['quantile'] = df.groupby('date')['pred_return'].transform(
             lambda x: pd.qcut(x.rank(method='first'), q=quantiles, labels=False) + 1
         )
         
-        # 2. Calculate the mean actual target value for each quantile per day
-        # Shape: (Dates as index, Quantiles 1-10 as columns)
-        daily_quantile_returns = df.groupby(['date', 'quantile'])[target_col].mean().unstack()
-        
-        # Drop days where we couldn't form a full set of quantiles
-        daily_quantile_returns = daily_quantile_returns.dropna()
-        
+        daily_quantile_returns = df.groupby(['date', 'quantile'])[target_col].mean().unstack().dropna()
         if daily_quantile_returns.empty:
             print("Not enough data to form quantiles.")
             return
             
-        # 3. Calculate Long-Short Spread (Top Quantile - Bottom Quantile)
+        # This daily_spread is mathematically an N-day return realized over N days
         daily_spread = daily_quantile_returns[quantiles] - daily_quantile_returns[1]
         
-        # 4. Summary Metrics
         mean_spread = daily_spread.mean()
         win_rate = (daily_spread > 0).mean()
         
-        # Calculate Effective Sharpe (adjusting for N-day overlap)
+        # Extract N for overlap adjustment
         match = re.search(r'(?:FWD_LOG_RET|TARGET_SHARPE)_(\d+)', self.target_key)
         N = int(match.group(1)) if match else 1
         
-        std_spread = daily_spread.std()
-        if std_spread != 0 and not np.isnan(std_spread):
-            # Annualize and adjust standard error for overlapping paths
-            sharpe = (mean_spread / std_spread) * np.sqrt(252 / N)
-        else:
-            sharpe = np.nan
-            
-        print(f"Mean Daily Target Spread : {mean_spread:.4f}")
-        print(f"Spread Win Rate          : {win_rate:.2%}")
-        print(f"Estimated Annual Sharpe  : {sharpe:.4f}")
+        # Calculate PSR and DSR using the unannualized N-day spread
+        sr_hat, psr, dsr, sr0 = self._calculate_psr_dsr(daily_spread, N_horizon=N)
         
-        # 5. Plotting
+        # Annualize for human-readable output
+        # Because the spread is an N-day return, there are (252/N) periods in a year
+        ann_factor = np.sqrt(252 / N)
+        annualized_sr = sr_hat * ann_factor
+        annualized_sr0 = sr0 * ann_factor
+        
+        print(f"Mean Target Spread       : {mean_spread:.4f}")
+        print(f"Spread Win Rate          : {win_rate:.2%}")
+        print("-" * 40)
+        print("ROBUST PERFORMANCE METRICS")
+        print("-" * 40)
+        print(f"Standard Annualized Sharpe : {annualized_sr:.4f}")
+        print(f"Probabilistic Sharpe (PSR) : {psr:.2%}  <-- (Target: > 95%)")
+        
+        if not np.isnan(dsr):
+            print(f"Experiments Run (Optuna N) : {len(self.study.trials)}")
+            print(f"Expected Max Sharpe (SR0)  : {annualized_sr0:.4f} (Annualized)")
+            print(f"Deflated Sharpe (DSR)      : {dsr:.2%}  <-- (Target: > 95%)")
+        else:
+             print("* Tune params first to calculate DSR *")
+        print("-" * 40)
+        
         if plot:
             import matplotlib.pyplot as plt
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
             
-            # Plot 1: Mean Target by Quantile (Check for monotonicity)
             overall_q_mean = daily_quantile_returns.mean()
             axes[0].bar(overall_q_mean.index, overall_q_mean.values, color='skyblue', edgecolor='black')
             axes[0].set_title("Average Target Value by Prediction Quantile")
-            axes[0].set_xlabel("Quantile (1 = Worst Prediction, 10 = Best Prediction)")
-            axes[0].set_ylabel(f"Mean Actual {target_col}")
-            axes[0].set_xticks(range(1, quantiles + 1))
             axes[0].axhline(0, color='red', linestyle='--', linewidth=1)
             
-            # Plot 2: Cumulative Long-Short Spread (Alpha Generation)
-            cumulative_spread = daily_spread.cumsum()
-            axes[1].plot(cumulative_spread.index, cumulative_spread.values, color='purple', linewidth=2)
-            axes[1].set_title("Cumulative Long-Short Spread (Alpha)")
-            axes[1].set_xlabel("Date")
-            axes[1].set_ylabel("Cumulative Target Spread")
-            axes[1].axhline(0, color='black', linewidth=1)
-            axes[1].grid(True, alpha=0.3)
+            # Since daily_spread represents overlapping N-day returns, taking cumulative sum
+            # directly drastically exaggerates the equity curve. We divide by N to approximate daily PnL.
+            approx_daily_pnl = daily_spread / N
+            cumulative_spread = approx_daily_pnl.cumsum()
             
+            axes[1].plot(cumulative_spread.index, cumulative_spread.values, color='purple', linewidth=2)
+            axes[1].set_title(f"Cumulative Long-Short Spread (Scaled by 1/{N})")
+            axes[1].axhline(0, color='black', linewidth=1)
             plt.tight_layout()
             plt.show()
             
         return daily_quantile_returns, daily_spread
-    
-    import pandas as pd
 
     def apply_kuhn_johnson_reduction(self, threshold=0.75):
         """
@@ -1116,6 +1136,58 @@ class Model:
             if pct_importance > 0.25:
                 print(f"🚨 WARNING: '{feat}' accounts for {pct_importance:.1%} of model's predictive power.")
                 print("   This almost always indicates a look-ahead bias (data leakage).")
+
+    def _calculate_psr_dsr(self, spread_returns, N_horizon):
+        '''
+        Method for calculating probabilistic and deflated sharpe ratios
+        '''
+        from scipy.stats import skew, kurtosis, norm
+        
+        # 1. Unannualized Stats
+        returns = np.asarray(spread_returns.dropna())
+        if len(returns) < 2 or np.std(returns, ddof=1) == 0:
+            return 0.0, 0.0, 0.0, 0.0
+            
+        mean_ret = np.mean(returns)
+        std_ret = np.std(returns, ddof=1)
+        sr_hat = mean_ret / std_ret  
+        
+        # 2. Adjust Degrees of Freedom (T) for overlapping N-day holds
+        T_total = len(returns)
+        T_effective = T_total / N_horizon 
+        
+        skewness = skew(returns, bias=False)
+        kurt = kurtosis(returns, fisher=False, bias=False)
+        
+        psr_denom = np.sqrt(1 - skewness * sr_hat + ((kurt - 1) / 4) * (sr_hat ** 2))
+        
+        # 3. Calculate PSR (Benchmark = 0)
+        psr_stat = (sr_hat - 0.0) * np.sqrt(T_effective - 1) / psr_denom
+        psr = norm.cdf(psr_stat)
+        
+        # 4. Calculate DSR using Optuna Trials
+        dsr = np.nan
+        sr0 = 0.0
+        
+        # Extract N_trials and variance from Optuna if tuned
+        if hasattr(self, 'study'):
+            trials = [t.value for t in self.study.trials if t.value is not None]
+            N_trials = len(trials)
+            
+            if N_trials > 1:
+                # Approximate Sharpe variance from the Optuna metric variance
+                var_trials = np.var(trials) 
+                
+                euler_gamma = np.euler_gamma
+                term1 = (1 - euler_gamma) * norm.ppf(1 - 1/N_trials)
+                term2 = euler_gamma * norm.ppf(1 - (1/N_trials) * np.exp(-1))
+                
+                sr0 = np.sqrt(var_trials) * (term1 + term2)
+                
+                dsr_stat = (sr_hat - sr0) * np.sqrt(T_effective - 1) / psr_denom
+                dsr = norm.cdf(dsr_stat)
+                
+        return sr_hat, psr, dsr, sr0
 
 class PortfolioStrat:
     def __init__(self):
