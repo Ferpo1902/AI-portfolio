@@ -428,14 +428,17 @@ class Model:
         match = re.search(r'_(\d+)', self.target.name)
         purge_gap_days = int(match.group(1)) if match else 1
 
-        # Shift the validation and test start dates forward by the purge gap
-        purge_offset = pd.Timedelta(days=purge_gap_days + 2) # +2 for weekends
+        # ADD AN EMBARGO GAP (1% of unique dates, minimum 5 days) to prevent autocorrelation
+        embargo_days = max(5, int(len(unique_dates) * 0.01))
+        
+        # Shift the validation and test start dates forward by both the purge AND embargo gap
+        gap_offset = pd.Timedelta(days=purge_gap_days + embargo_days + 2) # +2 for weekends
 
         self.train_df = self.data[self.data['date'] < train_cutoff]
-        # VALIDATION starts AFTER the purge gap
-        self.val_df = self.data[(self.data['date'] >= (train_cutoff + purge_offset)) & (self.data['date'] < val_cutoff)]
-        # TEST starts AFTER the purge gap
-        self.test_df = self.data[(self.data['date'] >= (val_cutoff + purge_offset)) & (self.data['date'] < test_cutoff)]
+        # VALIDATION starts AFTER the purge & embargo gap
+        self.val_df = self.data[(self.data['date'] >= (train_cutoff + gap_offset)) & (self.data['date'] < val_cutoff)]
+        # TEST starts AFTER the purge & embargo gap
+        self.test_df = self.data[(self.data['date'] >= (val_cutoff + gap_offset)) & (self.data['date'] < test_cutoff)]
         self.features = [key for key in self.data.keys() if "F" in key.split("_")]
         self.targets = [key for key in self.data.keys() if "T" in key.split("_")]
         self.target_key = self.targets[0]
@@ -448,6 +451,11 @@ class Model:
         self.X_test, self.y_test_bin = self.test_df[self.features], self.test_df[self.targets[0]]
 
         self.data_split = True
+
+        if self.has_folder == True:
+            dates = {"train_cutoff": train_cutoff,
+                     "val_cutoff": val_cutoff,
+                     "test_cutoff": test_cutoff}
 
     def tune_params(self):
         if self.data_split == False:
@@ -617,13 +625,17 @@ class Model:
         #====================
         #Injecting Noise to features & targets
         if inject_noise == True:
-            bps_3 = 0.0003 #use 3 basis points
-            for feature_key in self.feature_keys:
-                #for each feature, add 1-3 (0.01 - )
-                noise = np.random.normal(loc=0.0, scale=bps_3, size=len(self.data[feature_key].values))
-                self.data[feature_key] = self.data.feature_key * noise
-            noise = np.random.normal(loc=0.0, scale=bps_3, size=len(self.data[feature_key].values))
-            self.data[self.target_key] = self.data[self.target_key]*noise
+            bps_3 = 0.0003
+            n_rows = len(self.data)
+            n_features = len(self.feature_keys)
+
+            # Generate a 2D matrix of noise for ALL features at once
+            feature_noise = np.random.normal(loc=1.0, scale=bps_3, size=(n_rows, n_features))
+            self.data[self.feature_keys] = self.data[self.feature_keys] * feature_noise
+
+            # Add noise to target
+            target_noise = np.random.normal(loc=1.0, scale=bps_3, size=n_rows)
+            self.data[self.target_key] = self.data[self.target_key] * target_noise
         #====================
         self.model = lgb.train(
                 params,
