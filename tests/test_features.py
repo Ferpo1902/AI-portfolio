@@ -38,7 +38,8 @@ test_adx_regime = 0
 test_range_features = 0
 test_gap_sigma = 0
 test_sharpe_target = 0
-test_cross_sectional_z = 1
+test_cross_sectional_z = 0
+test_rate_features = 1
 
 #testing the model
 test_model = 0
@@ -1304,5 +1305,97 @@ if test_cross_sectional_z == True:
     ax2.legend()
     
     plt.suptitle(f"Cross-Sectional Standardization Test for {pd.to_datetime(sample_date).date()}", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+if test_rate_features == True:
+    print("--- Starting Rate Feature Test ---")
+    
+    #get data
+    df = pd.read_feather("../Data/all_ohlcv.feather")
+    df["date"] = pd.to_datetime(df["date"])
+    sample_price_df = df[df.act_symbol == "AAPL"]
+
+    # 1. Define the Rate Requests
+    # We will test all 3 calculations: Spread, Butterfly, and Velocity
+    rate_requests =[
+        RateFeatureRequest(name='SPREAD', term1='10_year', term2='2_year'),
+        RateFeatureRequest(name='BUTTERFLY', term1='10_year', term2='2_year', term3='3_month'),
+        RateFeatureRequest(name='VELOCITY', term1='10_year', timeperiod=5)
+    ]
+    
+    # 2. Run the Engine
+    engine = FeatureEngine(rate_requests)
+    
+    # Make a copy of the sample data so we don't mutate your original workspace
+    test_df = sample_price_df.copy()
+    test_df = engine.compute(test_df)
+    
+    # 3. Define Expected Column Names based on the RateFeatureRequest logic
+    col_spread = 'RATE_SPR_10_year_2_year'
+    col_fly = 'RATE_FLY_10_year_2_year_3_month'
+    col_vel = 'RATE_VEL_10_year_5d'
+    
+    # We need to temporarily merge the raw rates just to plot them side-by-side
+    raw_rates = pd.read_csv("../Data/treasury_rates.csv")
+    raw_rates['date'] = pd.to_datetime(raw_rates['date'])
+    plot_df = pd.merge(test_df, raw_rates[['date', '10_year', '2_year', '3_month']], on='date', how='left')
+    
+    # ---------------------------------------------------------
+    # 4. ASSERTIONS: Ensure no unexpected missing values
+    # ---------------------------------------------------------
+    print("\nRunning Assertions...")
+    
+    # Spread and Butterfly should have ZERO NaNs (since you forward-filled the raw data)
+    assert plot_df[col_spread].isna().sum() == 0, f"Error: Found NaNs in {col_spread}!"
+    assert plot_df[col_fly].isna().sum() == 0, f"Error: Found NaNs in {col_fly}!"
+    
+    # Velocity should have EXACTLY 'timeperiod' NaNs at the very beginning of the dataset 
+    # (Because you can't look back 5 days on day 1). Everything after day 5 should be non-NaN.
+    vel_nans = plot_df[col_vel].isna().sum()
+    expected_nans = 5 # matching timeperiod=5
+    assert vel_nans == expected_nans, f"Expected {expected_nans} NaNs in Velocity due to lookback, found {vel_nans}!"
+    
+    print("✅ All assertions passed! No unexpected missing values found.")
+    
+    # ---------------------------------------------------------
+    # 5. PLOTTING
+    # ---------------------------------------------------------
+    print("\nGenerating Plots...")
+    fig, axes = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
+    
+    # Plot 1: Raw Rates
+    axes[0].plot(plot_df['date'], plot_df['10_year'], label='10 Year', color='navy')
+    axes[0].plot(plot_df['date'], plot_df['2_year'], label='2 Year', color='darkorange')
+    axes[0].plot(plot_df['date'], plot_df['3_month'], label='3 Month', color='green')
+    axes[0].set_title('Raw Treasury Rates')
+    axes[0].set_ylabel('Yield (%)')
+    axes[0].legend()
+    axes[0].grid(True, alpha=0.3)
+    
+    # Plot 2: Spread
+    axes[1].plot(plot_df['date'], plot_df[col_spread], label='10Y - 2Y Spread', color='purple')
+    axes[1].axhline(0, color='black', linestyle='--', alpha=0.5)
+    axes[1].set_title('Rate Spread (10Y - 2Y)')
+    axes[1].set_ylabel('Spread (%)')
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    
+    # Plot 3: Butterfly
+    axes[2].plot(plot_df['date'], plot_df[col_fly], label='Butterfly (10Y + 3M - 2*2Y)', color='teal')
+    axes[2].axhline(0, color='black', linestyle='--', alpha=0.5)
+    axes[2].set_title('Rate Butterfly')
+    axes[2].set_ylabel('Curvature')
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+    
+    # Plot 4: Velocity
+    axes[3].plot(plot_df['date'], plot_df[col_vel], label='10Y Velocity (5-Day Change)', color='firebrick')
+    axes[3].axhline(0, color='black', linestyle='--', alpha=0.5)
+    axes[3].set_title('Rate Velocity (5 Trading Day Change of 10Y)')
+    axes[3].set_ylabel('Absolute Change')
+    axes[3].legend()
+    axes[3].grid(True, alpha=0.3)
+    
     plt.tight_layout()
     plt.show()
