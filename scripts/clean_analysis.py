@@ -353,8 +353,12 @@ class Universe:
         return final_df
 
 class Model:
-    def __init__(self, universe_data, model_folder = None):
-        self.data = universe_data #all data to train the model on
+    def __init__(self, universe_path, model_folder = None):
+        '''
+        universe_path should be the path to the universe file, saved as feather
+        '''
+        self.universe_path = universe_path
+        self.data = pd.read_feather(universe_path) #all data to train the model on
         self.data["date"] = pd.to_datetime(self.data["date"])
         self.has_features = False #no features upon initialization
         self.has_target = False #no target upon initialization
@@ -453,11 +457,72 @@ class Model:
         self.data_split = True
 
         if self.has_folder == True:
-            dates = {"train_cutoff": train_cutoff,
-                     "val_cutoff": val_cutoff,
-                     "test_cutoff": test_cutoff}
+            # --- REPLACE YOUR EXISTING 'dates' DICTIONARY WITH THIS ---
+            dates = {
+                "train_start": [self.train_df['date'].min()],
+                "train_end":[self.train_df['date'].max()],
+                "val_start": [self.val_df['date'].min()],
+                "val_end": [self.val_df['date'].max()],
+                "test_start": [self.test_df['date'].min()],
+                "test_end":[self.test_df['date'].max()]
+            }
+            # ----------------------------------------------------------
+            dates_df = pd.DataFrame(dates)
+            dates_df.to_csv(f"{self.model_folder}/dates.csv")
 
-    def tune_params(self):
+    def split_data_by_dates(self, train_start, val_start, test_start, test_end):
+        """
+        Splits data using explicit date boundaries, retaining purge and embargo gaps.
+        Dates should be passed as strings (e.g., '2015-01-01') or pd.Timestamp.
+        """
+        self.generate_targets_and_features()
+        if not self.has_features or not self.has_target:
+            raise Exception("Features or target missing.")
+
+        train_start = pd.to_datetime(train_start)
+        val_start = pd.to_datetime(val_start)
+        test_start = pd.to_datetime(test_start)
+        test_end = pd.to_datetime(test_end)
+
+        unique_dates = sorted(self.data['date'].unique())
+
+        # Extract Purge
+        match = re.search(r'_(\d+)', self.target_key)
+        purge_gap_days = int(match.group(1)) if match else 1
+
+        # Calculate Embargo (1% of total dataset dates)
+        embargo_days = max(5, int(len(unique_dates) * 0.01))
+        gap_offset = pd.Timedelta(days=purge_gap_days + embargo_days + 2)
+
+        # Split with gaps applied to the BEGINNING of val and test sets
+        self.train_df = self.data[(self.data['date'] >= train_start) & (self.data['date'] < val_start)]
+        self.val_df = self.data[(self.data['date'] >= (val_start + gap_offset)) & (self.data['date'] < test_start)]
+        self.test_df = self.data[(self.data['date'] >= (test_start + gap_offset)) & (self.data['date'] < test_end)]
+
+        self.features =[key for key in self.data.keys() if "F" in key.split("_")]
+        self.targets =[key for key in self.data.keys() if "T" in key.split("_")]
+
+        if len(self.targets) != 1:
+            raise Exception(f"Only one target allowed. Identified: {self.targets}")
+
+        self.X_train, self.y_train = self.train_df[self.features], self.train_df[self.target_key]
+        self.X_val, self.y_val = self.val_df[self.features], self.val_df[self.target_key]
+        self.X_test, self.y_test_bin = self.test_df[self.features], self.test_df[self.target_key]
+
+        self.data_split = True
+
+        if self.has_folder:
+            dates = {
+                "train_start": [self.train_df['date'].min()],
+                "train_end":[self.train_df['date'].max()],
+                "val_start": [self.val_df['date'].min()],
+                "val_end": [self.val_df['date'].max()],
+                "test_start": [self.test_df['date'].min()],
+                "test_end":[self.test_df['date'].max()]
+            }
+            pd.DataFrame(dates).to_csv(f"{self.model_folder}/dates.csv")
+
+    def tune_params(self, n_trials:int = 50):
         if self.data_split == False:
             raise Exception("Data must be split before tuning params")
         print("TUNING PARAMS...")
@@ -564,7 +629,7 @@ class Model:
                 return return_val
 
         study = optuna.create_study(direction=direction) 
-        study.optimize(objective, n_trials=50)
+        study.optimize(objective, n_trials=n_trials)
         self.best_params = study.best_params
         self.study = study
         self.params_tuned = True
@@ -646,6 +711,11 @@ class Model:
         self.test_model()
         if self.has_folder == True:
             self.model.save_model(f"{self.model_folder}/model.txt")
+            info = {
+                "universe_path": [self.universe_path]
+            }
+            info_df = pd.DataFrame(info)
+            info_df.to_csv(f"{self.model_folder}/info.csv")
 
     def test_model(self):
         """Tests the model after generating
@@ -1253,8 +1323,3 @@ class Model:
                 dsr = norm.cdf(dsr_stat)
                 
         return sr_hat, psr, dsr, sr0
-
-class PortfolioStrat:
-    def __init__(self):
-        pass
-
