@@ -830,54 +830,102 @@ class Model:
             
         return mean_ic, std_ic, ic_ir, ann_ic_ir, t_stat
     
-    def evaluate_quantile_spread(self, quantiles=10, plot=True):
+    def evaluate_quantile_spread(self, quantiles=10, plot=True, cost_bps=5.0):
+        """
+        Evaluates long-short spread between top and bottom quantile.
+
+        Args:
+            quantiles: Number of quantile buckets.
+            plot: Whether to show charts.
+            cost_bps: One-way transaction cost in basis points (e.g. 5 = 0.05%).
+                      Applied as round-trip (2x) on each rebalancing period,
+                      scaled by the measured portfolio turnover rate.
+        """
         import re
-        
+
         if "pred_return" not in self.test_df.columns:
             raise Exception("Model has not generated predictions yet. Run test_model() first.")
-            
+
         df = self.test_df.copy()
         target_col = self.targets[0]
-        
+
         print(f"\nQUANTILE SPREAD ANALYSIS (Top {100/quantiles:.1f}% vs Bottom {100/quantiles:.1f}%)")
         print("========================")
-        
+
         df['quantile'] = df.groupby('date')['pred_return'].transform(
             lambda x: pd.qcut(x.rank(method='first'), q=quantiles, labels=False) + 1
         )
-        
+
         daily_quantile_returns = df.groupby(['date', 'quantile'])[target_col].mean().unstack().dropna()
         if daily_quantile_returns.empty:
             print("Not enough data to form quantiles.")
             return
-            
+
         # This daily_spread is mathematically an N-day return realized over N days
         daily_spread = daily_quantile_returns[quantiles] - daily_quantile_returns[1]
-        
-        mean_spread = daily_spread.mean()
-        win_rate = (daily_spread > 0).mean()
-        
-        # Extract N for overlap adjustment
+
+        # Extract N (holding period) for overlap adjustment and rebalancing cost
         match = re.search(r'(?:FWD_LOG_RET|TARGET_SHARPE)_(\d+)', self.target_key)
         N = int(match.group(1)) if match else 1
-        
-        # Calculate PSR and DSR using the unannualized N-day spread
+
+        # --- TRANSACTION COST ADJUSTMENT ---
+        # Measure turnover: fraction of the top/bottom quantile that changes each period.
+        # We sample every N rows (one non-overlapping rebalancing period) to avoid double-counting.
+        sorted_dates = sorted(df['date'].unique())
+        rebal_dates = sorted_dates[::N]  # one date per holding period
+
+        top_q_prev, bot_q_prev = set(), set()
+        turnover_rates = []
+        for date in rebal_dates:
+            day_df = df[df['date'] == date]
+            n_top = max(1, len(day_df) // quantiles)
+            top_q_curr = set(day_df.nlargest(n_top, 'pred_return')['act_symbol'])
+            bot_q_curr = set(day_df.nsmallest(n_top, 'pred_return')['act_symbol'])
+            if top_q_prev and bot_q_prev:
+                top_changed = len(top_q_curr.symmetric_difference(top_q_prev)) / max(len(top_q_prev | top_q_curr), 1)
+                bot_changed = len(bot_q_curr.symmetric_difference(bot_q_prev)) / max(len(bot_q_prev | bot_q_curr), 1)
+                turnover_rates.append((top_changed + bot_changed) / 2)
+            top_q_prev, bot_q_prev = top_q_curr, bot_q_curr
+
+        avg_turnover = float(np.mean(turnover_rates)) if turnover_rates else 1.0
+        # Round-trip cost per rebalancing period (2x one-way cost, scaled by turnover)
+        cost_per_period = 2 * (cost_bps / 10_000) * avg_turnover
+
+        # Apply cost every N calendar dates (one rebalancing period)
+        cost_series = pd.Series(0.0, index=daily_spread.index)
+        for date in rebal_dates:
+            if date in cost_series.index:
+                cost_series[date] = cost_per_period
+
+        daily_spread_net = daily_spread - cost_series
+        # -----------------------------------
+
+        mean_spread = daily_spread.mean()
+        mean_spread_net = daily_spread_net.mean()
+        win_rate = (daily_spread > 0).mean()
+        win_rate_net = (daily_spread_net > 0).mean()
+
+        # Calculate PSR and DSR on gross spread
         sr_hat, psr, dsr, sr0 = self._calculate_psr_dsr(daily_spread, N_horizon=N)
-        
-        # Annualize for human-readable output
-        # Because the spread is an N-day return, there are (252/N) periods in a year
+        sr_hat_net, psr_net, _, _ = self._calculate_psr_dsr(daily_spread_net, N_horizon=N)
+
         ann_factor = np.sqrt(252 / N)
         annualized_sr = sr_hat * ann_factor
+        annualized_sr_net = sr_hat_net * ann_factor
         annualized_sr0 = sr0 * ann_factor
-        
-        print(f"Mean Target Spread       : {mean_spread:.4f}")
-        print(f"Spread Win Rate          : {win_rate:.2%}")
+
+        print(f"Mean Target Spread (Gross) : {mean_spread:.4f}")
+        print(f"Mean Target Spread (Net)   : {mean_spread_net:.4f}  (after {cost_bps}bps/leg costs)")
+        print(f"Avg Portfolio Turnover     : {avg_turnover:.1%}  per {N}-day rebalancing period")
+        print(f"Cost per Rebalance         : {cost_per_period*10_000:.1f}bps round-trip")
+        print(f"Spread Win Rate (Gross/Net): {win_rate:.2%} / {win_rate_net:.2%}")
         print("-" * 40)
         print("ROBUST PERFORMANCE METRICS")
         print("-" * 40)
-        print(f"Standard Annualized Sharpe : {annualized_sr:.4f}")
-        print(f"Probabilistic Sharpe (PSR) : {psr:.2%}  <-- (Target: > 95%)")
-        
+        print(f"Gross Annualized Sharpe    : {annualized_sr:.4f}")
+        print(f"Net   Annualized Sharpe    : {annualized_sr_net:.4f}  <-- USE THIS")
+        print(f"Probabilistic Sharpe (PSR) : {psr_net:.2%}  <-- (Target: > 95%)")
+
         if not np.isnan(dsr):
             print(f"Experiments Run (Optuna N) : {len(self.study.trials)}")
             print(f"Expected Max Sharpe (SR0)  : {annualized_sr0:.4f} (Annualized)")
@@ -885,28 +933,29 @@ class Model:
         else:
              print("* Tune params first to calculate DSR *")
         print("-" * 40)
-        
+
         if plot:
             import matplotlib.pyplot as plt
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            
+
             overall_q_mean = daily_quantile_returns.mean()
             axes[0].bar(overall_q_mean.index, overall_q_mean.values, color='skyblue', edgecolor='black')
             axes[0].set_title("Average Target Value by Prediction Quantile")
             axes[0].axhline(0, color='red', linestyle='--', linewidth=1)
-            
-            # Since daily_spread represents overlapping N-day returns, taking cumulative sum
-            # directly drastically exaggerates the equity curve. We divide by N to approximate daily PnL.
-            approx_daily_pnl = daily_spread / N
-            cumulative_spread = approx_daily_pnl.cumsum()
-            
-            axes[1].plot(cumulative_spread.index, cumulative_spread.values, color='purple', linewidth=2)
+
+            # Approximate daily PnL by dividing by N (overlapping N-day returns)
+            approx_gross = (daily_spread / N).cumsum()
+            approx_net   = (daily_spread_net / N).cumsum()
+
+            axes[1].plot(approx_gross.index, approx_gross.values, color='purple', linewidth=2, label='Gross')
+            axes[1].plot(approx_net.index,   approx_net.values,   color='darkorange', linewidth=2, label=f'Net ({cost_bps}bps/leg)')
             axes[1].set_title(f"Cumulative Long-Short Spread (Scaled by 1/{N})")
             axes[1].axhline(0, color='black', linewidth=1)
+            axes[1].legend()
             plt.tight_layout()
             plt.show()
-            
-        return daily_quantile_returns, daily_spread
+
+        return daily_quantile_returns, daily_spread_net
 
     def apply_kuhn_johnson_reduction(self, threshold=0.75):
         """
