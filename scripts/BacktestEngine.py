@@ -268,15 +268,38 @@ class BacktestEngine:
         if self.spy_csv is None:
             return None
         try:
-            spy = pd.read_csv(self.spy_csv, parse_dates=["date"])
-            spy = spy.sort_values("date").set_index("date")
-            spy_log = np.log(spy["close"] / spy["close"].shift(1)).dropna()
+            spy = pd.read_csv(self.spy_csv)
+
+            # Normalize column names: lowercase + strip spaces
+            spy.columns = [c.strip().lower().replace("/", "_").replace(" ", "_") for c in spy.columns]
+
+            # Accept several common date column names
+            date_col = next((c for c in spy.columns if c in ("date", "time", "timestamp")), None)
+            if date_col is None:
+                raise ValueError(f"No date column found. Columns: {spy.columns.tolist()}")
+
+            # Accept several common close price column names
+            close_col = next(
+                (c for c in spy.columns if c in ("close", "close_last", "adj_close", "adjclose", "price")),
+                None,
+            )
+            if close_col is None:
+                raise ValueError(f"No close column found. Columns: {spy.columns.tolist()}")
+
+            spy[date_col]  = pd.to_datetime(spy[date_col])
+            spy[close_col] = pd.to_numeric(spy[close_col].astype(str).str.replace(",", ""), errors="coerce")
+
+            spy = spy.sort_values(date_col).set_index(date_col)
+            spy_log = np.log(spy[close_col] / spy[close_col].shift(1)).dropna()
             spy_cum = spy_log.cumsum()
+
             # Align to strategy rebalancing dates
             spy_aligned = spy_cum.reindex(strategy_index, method="ffill")
+
             # Zero-base at strategy start
-            first_valid = spy_aligned.dropna().iloc[0] if not spy_aligned.dropna().empty else 0
-            return spy_aligned - first_valid
+            first_valid = spy_aligned.dropna()
+            offset = float(first_valid.iloc[0]) if len(first_valid) > 0 else 0.0
+            return spy_aligned - offset
         except Exception as e:
             print(f"[BacktestEngine] Could not load SPY benchmark: {e}")
             return None
